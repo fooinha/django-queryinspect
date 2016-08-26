@@ -9,6 +9,7 @@ from django.conf import settings
 from django.db import connection
 from django.core.exceptions import MiddlewareNotUsed
 
+
 try:
     from django.db.backends.utils import CursorDebugWrapper
 except ImportError:
@@ -35,13 +36,122 @@ cfg = dict(
     stddev_limit=getattr(settings, 'QUERY_INSPECT_STANDARD_DEVIATION_LIMIT',
         None),
     absolute_limit=getattr(settings, 'QUERY_INSPECT_ABSOLUTE_LIMIT', None),
+    enabled_slowqueries=(settings.DEBUG and
+        getattr(settings, 'QUERY_INSPECT_SLOW_QUERIES_ENABLED', False)),
+    slowqueries_limit=getattr(settings, 'QUERY_INSPECT_SLOW_QUERIES_LIMIT', 1),
+    enabled_slowqueries_not_using_index=getattr(settings, 'QUERY_INSPECT_SLOW_NOT_USING_INDEX', False)
 )
 
-__all__ = ['QueryInspectMiddleware']
+if cfg['enabled_slowqueries']:
+    try:
+        import MySQLdb as Database
+    except ImportError as e:
+        from django.core.exceptions import ImproperlyConfigured
+        raise ImproperlyConfigured("Error loading MySQLdb module: %s" % e)
 
+
+
+__all__ = ['QueryInspectMiddleware', 'SlowQueryInspectMiddleware']
+
+
+class SlowQueryInspectMiddleware(object):
+    start_dt = None
+    connection_id = None
+
+    long_query_time_str = ''
+    log_output_str = "SET GLOBAL log_output='TABLE'"
+    slow_query_log_to_table_str = "SET GLOBAL slow_query_log_file='TABLE'"
+    slow_query_log_true_str = "SET GLOBAL slow_query_log=TRUE"
+    slow_query_get_conn_id_str = "SELECT NOW(), CONNECTION_ID()"
+    log_queries_not_using_indexes_off_str = "SET GLOBAL log_queries_not_using_indexes=OFF"
+    log_queries_not_using_indexes_on_str = "SET GLOBAL log_queries_not_using_indexes=ON"
+
+    def __init__(self):
+        if not cfg['enabled_slowqueries']:
+            raise MiddlewareNotUsed()
+        self.long_query_time_str = "SET GLOBAL long_query_time={}".format(cfg['slowqueries_limit'])
+
+    def process_request(self, request=None):
+
+        # Validate if we're using the MySQL backend
+        if connection.vendor != 'mysql':
+            return
+
+        try:
+            connection.ensure_connection()
+            usable_conn = connection.is_usable()
+
+            if usable_conn:
+                cursor = connection.cursor()
+
+                cursor.execute(self.log_output_str)
+                cursor.execute(self.slow_query_log_to_table_str)
+                cursor.execute(self.slow_query_log_true_str)
+                cursor.execute(self.long_query_time_str)
+
+                if cfg['enabled_slowqueries_not_using_index']:
+                    cursor.execute(self.log_queries_not_using_indexes_on_str)
+                else:
+                    cursor.execute(self.log_queries_not_using_indexes_off_str)
+
+                cursor.execute(self.slow_query_get_conn_id_str)
+
+                result = cursor.fetchone()
+
+                self.start_dt = result[0]
+                self.connection_id = result[1]
+                log.debug("NOW() : {} - CONNECTION_ID(): {}".format(self.start_dt, self.connection_id))
+
+        except AttributeError as e:
+            log.warn("Failed to get an usable connection.")
+        except Exception as e:
+            log.warn(e.message)
+
+    # https://docs.djangoproject.com/en/1.10/topics/db/sql/
+    @staticmethod
+    def dictfetchall(cursor):
+        "Return all rows from a cursor as a dict"
+        columns = [col[0] for col in cursor.description]
+        return [
+            dict(zip(columns, row))
+            for row in cursor.fetchall()
+            ]
+
+    def process_response(self, request=None, response=None):
+
+        if not hasattr(self, "start_dt"):
+            return response
+
+        if not hasattr(self, "connection_id"):
+            return response
+
+        # Validate if we're using the MySQL backend
+        if connection.vendor != 'mysql':
+            return
+
+        try:
+            connection.ensure_connection()
+            usable_conn = connection.is_usable()
+
+            if usable_conn:
+                cursor = connection.cursor()
+                cursor.execute("""SELECT * FROM mysql.slow_log WHERE thread_id = %s AND
+                                  start_time >= %s AND start_time <= NOW()""", [self.connection_id, self.start_dt])
+                results = self.dictfetchall(cursor)
+
+                for row in results:
+                    log.debug(">>> SLOW QUERY <<<< [{}]".format(row['sql_text']))
+
+                response['X-QueryInspect-Slow-Queries'] = str(len(results))
+
+        except AttributeError as e:
+            log.warn("Failed to get an usable connection.")
+        except Exception as e:
+            log.warn(e.message)
+
+        return response
 
 class QueryInspectMiddleware(object):
-
     class QueryInfo(object):
         __slots__ = ('sql', 'time', 'tb')
 
@@ -197,7 +307,7 @@ class QueryInspectMiddleware(object):
     def process_response(self, request, response):
         if not hasattr(self, "request_start"):
             return response
-            
+
         request_time = time.time() - self.request_start
 
         infos = self.get_query_infos(
@@ -209,7 +319,6 @@ class QueryInspectMiddleware(object):
         self.output_stats(infos, num_duplicates, request_time, response)
 
         return response
-
 
 if cfg['enabled'] and cfg['log_tbs']:
     QueryInspectMiddleware.patch_cursor()
